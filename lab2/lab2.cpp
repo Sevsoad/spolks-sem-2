@@ -18,15 +18,17 @@ void pinger ();
 void catcher (int signum);
 unsigned short calculateChecksum (unsigned short *addr, int len);
 void timeValueSubstraction (struct timeval *out, struct timeval *in);
+unsigned long resolve (char *hostname);
 
 int socket_descriptor, packages_recieved = 0, packages_transmitted = 0;
-int kBufferSize = 1500;
-struct sockaddr_in servaddr;
-char *target_address;
+int kBufferSize = sizeof (struct iphdr) + sizeof (struct icmp) + 100;
+struct sockaddr_in destination_address;
+unsigned long source_name, target_name;
+struct hostent *host_name;
 
 int main(int argc,char *argv[]) {
-  if (argc < 1) {
-    return printf("Error: no ip address to ping.\n");
+  if (argc != 3) {
+    return printf("Error: wrong command.\n");
   }
 
   int buffer_size, n = 0;
@@ -35,7 +37,6 @@ int main(int argc,char *argv[]) {
   struct sigaction act;
   char recieve_buffer[kBufferSize];
   struct timeval tval;
-  struct hostent *host_name;
 
   socket_descriptor = socket (PF_INET, SOCK_RAW, IPPROTO_ICMP);
   if (socket_descriptor == -1) {
@@ -43,7 +44,11 @@ int main(int argc,char *argv[]) {
   }
   setuid (getuid());
 
+  printf("\n%s", argv[1]);
   setsockopt (socket_descriptor, SOL_SOCKET, SO_RCVBUF, &buffer_size
+              , sizeof (buffer_size));
+
+  setsockopt (socket_descriptor, SOL_SOCKET, IP_HDRINCL, &buffer_size
               , sizeof (buffer_size));
 
   memset (&act,  0, sizeof(act));
@@ -59,18 +64,21 @@ int main(int argc,char *argv[]) {
 
   setitimer (ITIMER_REAL, &timer, NULL);
 
-  bzero (&servaddr, sizeof(servaddr));
-  servaddr.sin_family = AF_INET;
-  
-  host_name = gethostbyname (argv[1]);
+  bzero (&destination_address, sizeof(destination_address));
+  destination_address.sin_family = AF_INET;
+/*
+  host_name = gethostbyname (argv[2]);
   if (host_name != NULL) {
-    memcpy (&servaddr.sin_addr, host_name->h_addr, host_name->h_length);
+    memcpy (&destination_address.sin_addr, host_name->h_addr, host_name->h_length);
   } else {
-    printf ("\naddress error\n");
+    printf ("\nhost_name error\n");
     return -1;
   }
-  
-  target_address = host_name->h_addr;
+*/
+
+  source_name = resolve(argv[1]);
+  target_name = resolve (argv[2]);
+  destination_address.sin_addr.s_addr = target_name;
 
   while (1) {
     n = recvfrom(socket_descriptor, recieve_buffer,
@@ -96,7 +104,7 @@ void catcher (int signum) {
     pinger ();
     return;
   } else if (signum == SIGINT) {
-    printf ("\n--- ping statistics --- \n");//, target_address);
+    printf ("\n--- ping statistics --- \n");
     printf ("%d packets transmitted, %d recieved, %d%% packet loss\n",
              packages_transmitted, packages_recieved,
               (100 - (packages_recieved*100
@@ -109,11 +117,26 @@ void catcher (int signum) {
 void pinger () {
   int icmplen = 64, pid, package_number = 0;
   struct icmp *icmp;
+  struct iphdr *ip_header;
   char sendbuf [kBufferSize];
 
   pid = getpid();
 
-  icmp = (struct icmp *) sendbuf;
+  ip_header = (struct iphdr *) sendbuf;
+  ip_header->ihl = 5;
+  ip_header->version = 4;
+  ip_header->tot_len = htons (kBufferSize);
+  ip_header->tos = 0;
+  ip_header->id = 0;
+  ip_header-> frag_off = 0;
+  ip_header->ttl = 255;
+  ip_header->protocol = IPPROTO_ICMP;
+  ip_header->check = 0;
+  ip_header->check = calculateChecksum ((unsigned short *) ip_header, sizeof (struct iphdr));
+  ip_header->saddr = source_name;
+  ip_header->daddr = target_name;
+
+  icmp = (struct icmp *) (sendbuf + sizeof (struct iphdr));
   icmp->icmp_type = ICMP_ECHO;
   icmp->icmp_code = 0;
   icmp->icmp_id = pid;
@@ -123,34 +146,14 @@ void pinger () {
   icmp->icmp_cksum = 0;
   icmp->icmp_cksum = calculateChecksum ((unsigned short *) icmp, icmplen);
 
-  if (sendto (socket_descriptor, sendbuf, icmplen, 0, (sockaddr *) &servaddr,
-               (socklen_t ) sizeof(servaddr)) < 0) {
-    perror("sendto() failed");
+  if (sendto (socket_descriptor, sendbuf, icmplen, 0, (sockaddr *) &destination_address,
+               (socklen_t ) sizeof(destination_address)) < 0) {
+    printf("\nsendto() failed");
     exit (-1);
   }
   packages_transmitted++;
 }
 
-unsigned short calculateChecksum (unsigned short * addr, int len) {
-  unsigned short result;
-  unsigned int sum = 0;
-  uint16_t *w = addr;
-
-  while (len > 1) {
-    sum += *w++;
-    len -= 2;
-  }
-
-  if (len == 1) {
-    sum += *(unsigned char*) addr;
-  }
-
-  sum = (sum >> 16) + (sum & 0xFFFF);
-  sum += (sum >> 16);
-  result = ~sum;
-
-  return result;
-}
 
 void printPackage (char *package_pointer, int package_length, struct timeval *tvrecv) {
   int ip_length, icmp_length;
@@ -184,9 +187,30 @@ void printPackage (char *package_pointer, int package_length, struct timeval *tv
 
     printf ("%d bytes from %s: icmp_req=%u, ttl=%d, time=%.3f ms\n"
             , icmp_length,
-            inet_ntoa (servaddr.sin_addr), ++packages_recieved,
+            inet_ntoa (destination_address.sin_addr), ++packages_recieved,
             ip_header->ip_ttl, round_trip_time);
   }
+}
+
+unsigned short calculateChecksum (unsigned short * addr, int len) {
+  unsigned short result;
+  unsigned int sum = 0;
+  uint16_t *w = addr;
+
+  while (len > 1) {
+    sum += *w++;
+    len -= 2;
+  }
+
+  if (len == 1) {
+    sum += *(unsigned char*) addr;
+  }
+
+  sum = (sum >> 16) + (sum & 0xFFFF);
+  sum += (sum >> 16);
+  result = ~sum;
+
+  return result;
 }
 
 void timeValueSubstraction (struct timeval *out, struct timeval *in) {
@@ -196,3 +220,14 @@ void timeValueSubstraction (struct timeval *out, struct timeval *in) {
   }
   out->tv_sec -= in->tv_sec;
 }
+
+unsigned long resolve (char *hostname) {
+  struct hostent *hp;
+
+  if ( (hp = gethostbyname (hostname)) == NULL) {
+    printf ("\ngethostbyname() error");
+    exit (-1);
+  }
+
+  return *(unsigned long *) hp->h_addr_list[0];
+ }
